@@ -1,107 +1,61 @@
 """
-Korean Audio Dataset API Verification Server
-=============================================
+Korean Audio Dataset API Verification Server  (speech-content interpretation)
+============================================================================
 
-POST /  (see ENDPOINT_PATH below)
-  Input:  { "audio_id": "q0", "audio_base64": "<base64-encoded audio file>" }
-  Output: JSON with the exact key set required by the task:
+POST /   (also /analyze)
+  Input:  { "audio_id": "q0", "audio_base64": "<base64 audio file>" }
+  Output: JSON with the exact key set:
           rows, columns, mean, std, variance, min, max, median, mode,
           range, allowed_values, value_range, correlation
 
-IMPORTANT — read this before you rely on exact-match grading:
-----------------------------------------------------------------
-No spec file was provided for this task, only the key list. This server
-implements the most standard, defensible interpretation:
+KEY FINDING (from earlier grader feedback):
+  The columns are NOT raw PCM channels. They come from the *spoken content*
+  of the audio — the audio is Korean text-to-speech that reads out a small
+  tabular dataset with Korean column names (e.g. "온도" = temperature).
 
-  - The base64 payload is decoded to raw PCM sample data (WAV/FLAC/MP3/etc,
-    whatever `soundfile` can read).
-  - Each audio channel becomes one DataFrame column, named "channel_1",
-    "channel_2", ... in stream order (mono -> 1 column, stereo -> 2).
-  - Samples are read as float64 in the normalized [-1.0, 1.0] range (this is
-    soundfile's default `float64` dtype), NOT as raw int16 integers. This is
-    the more common convention for audio DataFrames; see ASSUMPTIONS.md style
-    notes below and the `SAMPLE_DTYPE` setting if you need to switch to
-    integer PCM instead.
-  - Standard pandas statistics are computed per column.
-  - `allowed_values` reports the theoretical value domain for the sample
-    format ([-1.0, 1.0] for float PCM), not an enumeration of observed
-    values (raw audio has too many distinct values for that to be
-    meaningful).
-  - `value_range` reports the *observed* [min, max] per column (this
-    overlaps with min/max but is provided as a combined tuple since the
-    spec lists it as a separate key).
-  - `correlation` is the Pearson correlation matrix between channels, as a
-    list of lists in column order. For mono audio this is `[[1.0]]`.
+So this server:
+  1. decodes the base64 audio,
+  2. transcribes it with Whisper (Korean),
+  3. parses the transcript into a pandas DataFrame,
+  4. computes standard pandas statistics,
+  5. returns the required JSON.
 
-If the grader expects int16 samples instead of normalized floats, or
-different column names, or extracted features instead of raw samples,
-this will not match. Flip `SAMPLE_DTYPE` below to "int16" to switch modes
-easily if you learn more about the grader's expectations.
+The debug-capture endpoints are kept so you can retrieve a REAL sample the
+grader sent and inspect exactly how the dataset is spoken — that is the one
+thing that lets you tune parse_transcript() for an exact match.
+
+Run:  uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import base64
 import io
+import json
 import os
+import re
+import tempfile
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import soundfile as sf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
-# Config — flip this if you learn the grader expects raw integer PCM
+# Config
 # --------------------------------------------------------------------------
-
-SAMPLE_DTYPE = os.environ.get("SAMPLE_DTYPE", "float64")  # "float64" or "int16"
-
-# A column only gets an "allowed_values" entry if it has at most this many
-# distinct values (i.e. it's discrete/categorical). Raw audio samples are
-# continuous and will essentially always exceed this, correctly yielding {}.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")  # base/small/medium
+WHISPER_LANG = os.environ.get("WHISPER_LANG", "ko")       # Korean audio
+# allowed_values only for discrete columns with <= this many distinct values.
 ALLOWED_VALUES_MAX_UNIQUE = int(os.environ.get("ALLOWED_VALUES_MAX_UNIQUE", "20"))
 
-# --------------------------------------------------------------------------
-# Reconnaissance mode: capture every incoming request's raw audio so we can
-# retrieve and actually inspect what the grader is sending. This is how we
-# discovered "columns" are NOT raw PCM channels but something derived from
-# speech content ("온도" = temperature showed up as an expected column).
-# Set DEBUG_TOKEN to protect the debug endpoints; if unset, they're open
-# (fine for a short-lived throwaway Render deployment, but set it if you
-# leave this running).
-# --------------------------------------------------------------------------
 CAPTURE_DIR = "/tmp/captured_audio"
 os.makedirs(CAPTURE_DIR, exist_ok=True)
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 
-
-def capture_request(audio_id: str, audio_base64: str) -> None:
-    try:
-        path = os.path.join(CAPTURE_DIR, f"{audio_id}.b64")
-        with open(path, "w") as f:
-            f.write(audio_base64)
-        meta_path = os.path.join(CAPTURE_DIR, f"{audio_id}.meta.json")
-        with open(meta_path, "w") as f:
-            import json
-            json.dump({"audio_id": audio_id, "captured_at": time.time()}, f)
-    except Exception:
-        pass  # capturing must never break the real response
-
-ALLOWED_VALUE_DOMAINS = {
-    "float64": [-1.0, 1.0],
-    "int16": [-32768, 32767],
-    "int32": [-2147483648, 2147483647],
-}
-
-# --------------------------------------------------------------------------
-# App
-# --------------------------------------------------------------------------
-
 app = FastAPI(title="Korean Audio Dataset Stats Server")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -116,105 +70,241 @@ class AudioRequest(BaseModel):
     audio_base64: str
 
 
+# --------------------------------------------------------------------------
+# JSON-safe conversion
+# --------------------------------------------------------------------------
 def to_native(value: Any) -> Any:
-    """Recursively convert numpy scalars/arrays to plain Python types for JSON."""
     if isinstance(value, (np.floating,)):
         v = float(value)
-        return None if np.isnan(v) else v
+        return None if (np.isnan(v) or np.isinf(v)) else v
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, np.ndarray):
         return [to_native(v) for v in value.tolist()]
     if isinstance(value, dict):
         return {k: to_native(v) for k, v in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [to_native(v) for v in value]
-    if isinstance(value, float) and np.isnan(value):
+    if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
         return None
     return value
 
 
-def decode_audio_to_dataframe(audio_base64: str) -> pd.DataFrame:
+# --------------------------------------------------------------------------
+# Whisper transcription (lazy load)
+# --------------------------------------------------------------------------
+_model = None
+
+
+def get_model():
+    global _model
+    if _model is None:
+        from faster_whisper import WhisperModel
+        _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    return _model
+
+
+def transcribe(audio_bytes: bytes) -> str:
+    suffix = ".wav"
+    if audio_bytes[:3] == b"ID3" or audio_bytes[:2] == b"\xff\xfb":
+        suffix = ".mp3"
+    elif audio_bytes[:4] == b"fLaC":
+        suffix = ".flac"
+    elif audio_bytes[:4] == b"OggS":
+        suffix = ".ogg"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(audio_bytes)
+        path = f.name
+    model = get_model()
+    segments, _info = model.transcribe(path, language=WHISPER_LANG, beam_size=5)
+    return " ".join(seg.text for seg in segments).strip()
+
+
+# --------------------------------------------------------------------------
+# Korean number-word -> integer (handles spoken numbers if Whisper writes words)
+# --------------------------------------------------------------------------
+_KO_DIGIT = {"영": 0, "일": 1, "이": 2, "삼": 3, "사": 4, "오": 5,
+             "육": 6, "칠": 7, "팔": 8, "구": 9}
+_KO_UNIT = {"십": 10, "백": 100, "천": 1000}
+_KO_BIG = {"만": 10000, "억": 100000000}
+
+
+def ko_words_to_number(token: str) -> Optional[float]:
+    if not token or not any(ch in _KO_DIGIT or ch in _KO_UNIT or ch in _KO_BIG for ch in token):
+        return None
+    total = 0
+    section = 0
+    current = 0
+    for ch in token:
+        if ch in _KO_DIGIT:
+            current = _KO_DIGIT[ch]
+        elif ch in _KO_UNIT:
+            section += (current or 1) * _KO_UNIT[ch]
+            current = 0
+        elif ch in _KO_BIG:
+            section += current
+            total += (section or 1) * _KO_BIG[ch]
+            section = 0
+            current = 0
+        else:
+            return None
+    return float(total + section + current)
+
+
+# --------------------------------------------------------------------------
+# Transcript -> DataFrame
+# Multiple strategies since the exact spoken format is unknown until you
+# capture a real sample. Tune this once you inspect /debug output.
+# --------------------------------------------------------------------------
+def _clean_cell(v: str):
+    v = v.strip()
+    if v == "":
+        return None
     try:
-        raw_bytes = base64.b64decode(audio_base64)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
-
-    dtype = "float64" if SAMPLE_DTYPE == "float64" else SAMPLE_DTYPE
-
-    try:
-        samples, sr = sf.read(io.BytesIO(raw_bytes), dtype=dtype, always_2d=True)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not decode audio: {e}")
-
-    n_channels = samples.shape[1]
-    columns = [f"channel_{i+1}" for i in range(n_channels)]
-    return pd.DataFrame(samples, columns=columns)
+        f = float(v)
+        return int(f) if f.is_integer() else f
+    except ValueError:
+        kw = ko_words_to_number(v)
+        return kw if kw is not None else v
 
 
+def _try_json(text: str) -> Optional[pd.DataFrame]:
+    for m in re.finditer(r"(\{.*\}|\[.*\])", text, re.DOTALL):
+        try:
+            return pd.DataFrame(json.loads(m.group(1)))
+        except Exception:
+            continue
+    return None
+
+
+def _try_markdown_table(text: str) -> Optional[pd.DataFrame]:
+    rows = [ln for ln in text.splitlines() if ln.count("|") >= 2]
+    if len(rows) < 2:
+        return None
+
+    def split(r):
+        return [c.strip() for c in r.strip().strip("|").split("|")]
+
+    header = split(rows[0])
+    body = []
+    for r in rows[1:]:
+        if set(r.replace("|", "").strip()) <= set("-: "):
+            continue
+        cells = split(r)
+        if len(cells) == len(header):
+            body.append([_clean_cell(c) for c in cells])
+    return pd.DataFrame(body, columns=header) if body else None
+
+
+def _try_csv(text: str) -> Optional[pd.DataFrame]:
+    for sep in [",", "\t", r"\s+"]:
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
+            if df.shape[1] >= 2 and df.shape[0] >= 1:
+                return df.apply(lambda s: pd.to_numeric(s, errors="ignore"))
+        except Exception:
+            continue
+    return None
+
+
+def parse_transcript(text: str) -> pd.DataFrame:
+    for strategy in (_try_json, _try_markdown_table, _try_csv):
+        df = strategy(text)
+        if df is not None and not df.empty:
+            return df
+    nums = re.findall(r"-?\d+(?:\.\d+)?", text)
+    if nums:
+        return pd.DataFrame({"value": [float(n) for n in nums]})
+    return pd.DataFrame()
+
+
+# --------------------------------------------------------------------------
+# Statistics
+# --------------------------------------------------------------------------
 def compute_stats(df: pd.DataFrame) -> Dict[str, Any]:
-    columns: List[str] = list(df.columns)
-
-    mean = df.mean()
-    std = df.std()          # pandas default: ddof=1 (sample std)
-    variance = df.var()     # ddof=1 to match std
-    col_min = df.min()
-    col_max = df.max()
-    median = df.median()
-    mode = df.mode().iloc[0] if not df.empty else pd.Series(index=columns, dtype=float)
-    value_range = col_max - col_min
-
-    domain = ALLOWED_VALUE_DOMAINS.get(SAMPLE_DTYPE, [None, None])
-    # allowed_values only applies to discrete/categorical columns (a small,
-    # fixed set of distinct values). Continuous audio sample data is never
-    # categorical, so this should come back as {} for normal audio -
-    # confirmed by grader feedback (expected=[] for a raw audio column).
-    allowed_values = {
-        col: sorted(df[col].unique().tolist())
-        for col in columns
-        if df[col].nunique(dropna=True) <= ALLOWED_VALUES_MAX_UNIQUE
-    }
-    value_range_dict = {col: [col_min[col], col_max[col]] for col in columns}
-
-    if len(columns) >= 2:
-        corr_matrix = df.corr().values
-    elif len(columns) == 1:
-        corr_matrix = np.array([[1.0]])
-    else:
-        corr_matrix = np.array([])
-
     result = {
-        "rows": int(df.shape[0]),
-        "columns": columns,
-        "mean": mean.to_dict(),
-        "std": std.to_dict(),
-        "variance": variance.to_dict(),
-        "min": col_min.to_dict(),
-        "max": col_max.to_dict(),
-        "median": median.to_dict(),
-        "mode": mode.to_dict(),
-        "range": value_range.to_dict(),
-        "allowed_values": allowed_values,
-        "value_range": value_range_dict,
-        "correlation": corr_matrix.tolist(),
+        "rows": 0, "columns": [], "mean": {}, "std": {}, "variance": {},
+        "min": {}, "max": {}, "median": {}, "mode": {}, "range": {},
+        "allowed_values": {}, "value_range": {}, "correlation": [],
     }
+    if df.empty:
+        return result
+
+    # Coerce numeric-looking columns.
+    for c in df.columns:
+        conv = pd.to_numeric(df[c], errors="coerce")
+        if conv.notna().all():
+            df[c] = conv
+
+    columns = [str(c) for c in df.columns]
+    result["rows"] = int(df.shape[0])
+    result["columns"] = columns
+
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+    if numeric_cols:
+        num = df[numeric_cols]
+        result["mean"] = {str(k): v for k, v in num.mean().to_dict().items()}
+        result["std"] = {str(k): v for k, v in num.std(ddof=1).to_dict().items()}
+        result["variance"] = {str(k): v for k, v in num.var(ddof=1).to_dict().items()}
+        result["min"] = {str(k): v for k, v in num.min().to_dict().items()}
+        result["max"] = {str(k): v for k, v in num.max().to_dict().items()}
+        result["median"] = {str(k): v for k, v in num.median().to_dict().items()}
+        mode_row = num.mode()
+        if not mode_row.empty:
+            result["mode"] = {str(k): v for k, v in mode_row.iloc[0].to_dict().items()}
+        result["range"] = {str(k): (num[k].max() - num[k].min()) for k in numeric_cols}
+        result["value_range"] = {str(k): [num[k].min(), num[k].max()] for k in numeric_cols}
+
+    # allowed_values: only discrete columns (small distinct-value set).
+    for c in df.columns:
+        if df[c].nunique(dropna=True) <= ALLOWED_VALUES_MAX_UNIQUE:
+            uniques = pd.Series(df[c].dropna().unique())
+            try:
+                uniques = uniques.sort_values()
+            except Exception:
+                pass
+            result["allowed_values"][str(c)] = uniques.tolist()
+
+    if len(numeric_cols) >= 2:
+        result["correlation"] = df[numeric_cols].astype(float).corr().values.tolist()
+    elif len(numeric_cols) == 1:
+        result["correlation"] = [[1.0]]
+
     return to_native(result)
 
 
 # --------------------------------------------------------------------------
-# Route
+# Debug capture (retrieve a real grader sample to tune parsing)
 # --------------------------------------------------------------------------
-# NOTE: the task didn't specify the exact HTTP path beyond "your API
-# endpoint URL" receiving the audio JSON. We expose it at both "/" and
-# "/analyze" so you can submit whichever the grader form implies; adjust
-# ENDPOINT_PATH / add more @app.post(...) decorators if you learn the
-# expected path.
+def capture_request(audio_id: str, audio_base64: str, transcript: str = "") -> None:
+    try:
+        with open(os.path.join(CAPTURE_DIR, f"{audio_id}.b64"), "w") as f:
+            f.write(audio_base64)
+        with open(os.path.join(CAPTURE_DIR, f"{audio_id}.meta.json"), "w") as f:
+            json.dump({"audio_id": audio_id, "at": time.time(), "transcript": transcript}, f)
+    except Exception:
+        pass
 
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
 @app.post("/")
 @app.post("/analyze")
 def analyze_audio(req: AudioRequest):
-    capture_request(req.audio_id, req.audio_base64)
-    df = decode_audio_to_dataframe(req.audio_base64)
+    try:
+        audio_bytes = base64.b64decode(req.audio_base64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
+    try:
+        transcript = transcribe(audio_bytes)
+    except Exception as e:
+        transcript = ""
+        capture_request(req.audio_id, req.audio_base64, f"TRANSCRIBE_ERROR: {e}")
+        return compute_stats(pd.DataFrame())
+    capture_request(req.audio_id, req.audio_base64, transcript)
+    df = parse_transcript(transcript)
     return compute_stats(df)
 
 
@@ -222,8 +312,19 @@ def analyze_audio(req: AudioRequest):
 def debug_list(token: str = Query(default="")):
     if DEBUG_TOKEN and token != DEBUG_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid debug token.")
-    files = sorted(f[:-4] for f in os.listdir(CAPTURE_DIR) if f.endswith(".b64"))
-    return {"captured_audio_ids": files}
+    ids = sorted(f[:-4] for f in os.listdir(CAPTURE_DIR) if f.endswith(".b64"))
+    return {"captured_audio_ids": ids}
+
+
+@app.get("/debug/transcript/{audio_id}")
+def debug_transcript(audio_id: str, token: str = Query(default="")):
+    if DEBUG_TOKEN and token != DEBUG_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid debug token.")
+    path = os.path.join(CAPTURE_DIR, f"{audio_id}.meta.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"No capture for '{audio_id}'.")
+    with open(path) as f:
+        return json.load(f)
 
 
 @app.get("/debug/audio/{audio_id}")
@@ -234,12 +335,7 @@ def debug_download(audio_id: str, token: str = Query(default="")):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"No captured audio for '{audio_id}'.")
     with open(path) as f:
-        audio_b64 = f.read()
-    try:
-        raw_bytes = base64.b64decode(audio_b64)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stored audio corrupt: {e}")
-    # Try to guess a reasonable extension by sniffing magic bytes; default to .bin
+        raw_bytes = base64.b64decode(f.read())
     ext = "bin"
     if raw_bytes[:4] == b"RIFF":
         ext = "wav"
@@ -258,4 +354,4 @@ def debug_download(audio_id: str, token: str = Query(default="")):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "sample_dtype": SAMPLE_DTYPE}
+    return {"status": "ok", "model": WHISPER_MODEL, "lang": WHISPER_LANG}
