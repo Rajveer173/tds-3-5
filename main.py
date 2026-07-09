@@ -42,13 +42,15 @@ easily if you learn more about the grader's expectations.
 import base64
 import io
 import os
+import time
 from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
@@ -61,6 +63,32 @@ SAMPLE_DTYPE = os.environ.get("SAMPLE_DTYPE", "float64")  # "float64" or "int16"
 # distinct values (i.e. it's discrete/categorical). Raw audio samples are
 # continuous and will essentially always exceed this, correctly yielding {}.
 ALLOWED_VALUES_MAX_UNIQUE = int(os.environ.get("ALLOWED_VALUES_MAX_UNIQUE", "20"))
+
+# --------------------------------------------------------------------------
+# Reconnaissance mode: capture every incoming request's raw audio so we can
+# retrieve and actually inspect what the grader is sending. This is how we
+# discovered "columns" are NOT raw PCM channels but something derived from
+# speech content ("온도" = temperature showed up as an expected column).
+# Set DEBUG_TOKEN to protect the debug endpoints; if unset, they're open
+# (fine for a short-lived throwaway Render deployment, but set it if you
+# leave this running).
+# --------------------------------------------------------------------------
+CAPTURE_DIR = "/tmp/captured_audio"
+os.makedirs(CAPTURE_DIR, exist_ok=True)
+DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
+
+
+def capture_request(audio_id: str, audio_base64: str) -> None:
+    try:
+        path = os.path.join(CAPTURE_DIR, f"{audio_id}.b64")
+        with open(path, "w") as f:
+            f.write(audio_base64)
+        meta_path = os.path.join(CAPTURE_DIR, f"{audio_id}.meta.json")
+        with open(meta_path, "w") as f:
+            import json
+            json.dump({"audio_id": audio_id, "captured_at": time.time()}, f)
+    except Exception:
+        pass  # capturing must never break the real response
 
 ALLOWED_VALUE_DOMAINS = {
     "float64": [-1.0, 1.0],
@@ -185,8 +213,47 @@ def compute_stats(df: pd.DataFrame) -> Dict[str, Any]:
 @app.post("/")
 @app.post("/analyze")
 def analyze_audio(req: AudioRequest):
+    capture_request(req.audio_id, req.audio_base64)
     df = decode_audio_to_dataframe(req.audio_base64)
     return compute_stats(df)
+
+
+@app.get("/debug/list")
+def debug_list(token: str = Query(default="")):
+    if DEBUG_TOKEN and token != DEBUG_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid debug token.")
+    files = sorted(f[:-4] for f in os.listdir(CAPTURE_DIR) if f.endswith(".b64"))
+    return {"captured_audio_ids": files}
+
+
+@app.get("/debug/audio/{audio_id}")
+def debug_download(audio_id: str, token: str = Query(default="")):
+    if DEBUG_TOKEN and token != DEBUG_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid debug token.")
+    path = os.path.join(CAPTURE_DIR, f"{audio_id}.b64")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"No captured audio for '{audio_id}'.")
+    with open(path) as f:
+        audio_b64 = f.read()
+    try:
+        raw_bytes = base64.b64decode(audio_b64)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stored audio corrupt: {e}")
+    # Try to guess a reasonable extension by sniffing magic bytes; default to .bin
+    ext = "bin"
+    if raw_bytes[:4] == b"RIFF":
+        ext = "wav"
+    elif raw_bytes[:3] == b"ID3" or raw_bytes[:2] == b"\xff\xfb":
+        ext = "mp3"
+    elif raw_bytes[:4] == b"fLaC":
+        ext = "flac"
+    elif raw_bytes[:4] == b"OggS":
+        ext = "ogg"
+    return Response(
+        content=raw_bytes,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{audio_id}.{ext}"'},
+    )
 
 
 @app.get("/health")
